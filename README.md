@@ -51,6 +51,7 @@ Have any feedback or questions? [Create a discussion](https://github.com/TwiN/ga
     - [Functions](#functions)
   - [Web](#web)
   - [UI](#ui)
+    - [Dashboard history](#dashboard-history)
   - [Announcements](#announcements)
   - [Storage](#storage)
   - [Client configuration](#client-configuration)
@@ -296,6 +297,8 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].ssh.password`                      | SSH password (e.g. password).                                                                                                               | Required `""`              |
 | `endpoints[].alerts`                            | List of all alerts for a given endpoint. <br />See [Alerting](#alerting).                                                                   | `[]`                       |
 | `endpoints[].maintenance-windows`               | List of all maintenance windows for a given endpoint. <br />See [Maintenance](#maintenance).                                                | `[]`                       |
+| `endpoints[].maintenance-conditions`            | Conditions under which a successful check is shown as maintenance. <br />See [Maintenance reported by the endpoint](#maintenance-reported-by-the-endpoint). | `[]`                       |
+| `endpoints[].maintenance-message`               | Message shown for checks under maintenance; a literal or a placeholder. <br />See [Maintenance reported by the endpoint](#maintenance-reported-by-the-endpoint). | `""`                       |
 | `endpoints[].client`                            | [Client configuration](#client-configuration).                                                                                              | `{}`                       |
 | `endpoints[].ui`                                | UI configuration at the endpoint level.                                                                                                     | `{}`                       |
 | `endpoints[].ui.hide-conditions`                | Whether to hide conditions from the results. Note that this only hides conditions from results evaluated from the moment this was enabled.  | `false`                    |
@@ -306,6 +309,7 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].ui.dont-resolve-failed-conditions` | Whether to resolve failed conditions for the UI.                                                                                            | `false`                    |
 | `endpoints[].ui.resolve-successful-conditions`  | Whether to resolve successful conditions for the UI (helpful to expose body assertions even when checks pass).                              | `false`                    |
 | `endpoints[].ui.badge.response-time`            | List of response time thresholds. Each time a threshold is reached, the badge has a different color.                                        | `[50, 200, 300, 500, 750]` |
+| `endpoints[].ui.dashboard-history`              | Time window displayed on the dashboard for this endpoint. Overrides `ui.dashboard-history`. See [Dashboard history](#dashboard-history).    | `ui.dashboard-history`     |
 | `endpoints[].extra-labels`                      | Extra labels to add to the metrics. Useful for grouping endpoints together.                                                                 | `{}`                       |
 | `endpoints[].always-run`                        | (SUITES ONLY) Whether to execute this endpoint even if previous endpoints in the suite failed.                                              | `false`                    |
 | `endpoints[].store`                             | (SUITES ONLY) Map of values to extract from the response and store in the suite context (stored even on failure).                           | `{}`                       |
@@ -364,8 +368,12 @@ Where:
 - `{key}` has the pattern `<GROUP_NAME>_<ENDPOINT_NAME>` in which both variables have ` `, `/`, `_`, `,`, `.`, `#`, `+` and `&` replaced by `-`.
   - Using the example configuration above, the key would be `core_ext-ep-test`.
 - `{success}` is a boolean (`true` or `false`) value indicating whether the health check was successful or not.
-- `{error}` (optional): a string describing the reason for a failed health check. If {success} is false, this should contain the error message; if the check is successful, this will be ignored.
+- `{error}` (optional): a string describing the reason for a failed health check. If {success} is false, this should contain the error message; if the check is successful, this will be ignored. Repeat it
+  (`&error=...&error=...`) to report several errors; each is shown as an error of its own.
 - `{duration}` (optional): the time that the request took as a duration string (e.g. 10s).
+- `maintenance` (optional): `true` marks a successful result as maintenance, like
+  [`maintenance-conditions`](#maintenance-reported-by-the-endpoint) do for a polled endpoint; ignored when `{success}` is false.
+- `message` (optional): the maintenance message shown for a result marked as maintenance.
 
 You must also pass the token as a `Bearer` token in the `Authorization` header.
 
@@ -557,6 +565,39 @@ Allows you to configure the application wide defaults for the dashboard's UI. So
 | `ui.default-sort-by`      | Default sorting option for endpoints in the dashboard. Can be `name`, `group`, or `health`. Note that user preferences override this.    | `name`                                              |
 | `ui.default-filter-by`    | Default filter option for endpoints in the dashboard. Can be `none`, `failing`, or `unstable`. Note that user preferences override this. | `none`                                              |
 | `ui.login-subtitle`       | Subtitle displayed on the OIDC login page.                                                                                               | `System Monitoring Dashboard`                       |
+| `ui.dashboard-history`    | Time window displayed by each endpoint on the dashboard (e.g. `24h`). If not set, the last 50 results are displayed instead. See [Dashboard history](#dashboard-history). | `""`                                                |
+
+#### Dashboard history
+By default, each endpoint on the dashboard displays its last 50 results, which means that the period of time covered
+depends on the endpoint's interval (e.g. 50 minutes for an interval of 1m).
+
+If you'd rather display a fixed period of time regardless of the interval, you can set `ui.dashboard-history`
+globally and/or `endpoints[].ui.dashboard-history` for specific endpoints:
+```yaml
+ui:
+  dashboard-history: 24h
+endpoints:
+  - name: api
+    url: "https://example.org/health"
+    interval: 1m
+    ui:
+      dashboard-history: 1h # overrides ui.dashboard-history
+    conditions:
+      - "[STATUS] == 200"
+```
+The window is split into 50 bars of equal width (e.g. ~29 minutes each for `24h`), and the results within each bar are
+aggregated by the server:
+- green if every check within the bar was successful
+- orange if some, but not all, checks within the bar failed
+- red if every check within the bar failed
+- gray if there is no data
+
+If no check happened within a bar (e.g. a 1h interval with a 24h window), the bar takes the state of the most recent
+check that preceded it, as long as said check is not older than twice the endpoint's interval.
+
+Note that only the results that are stored can be displayed, so `storage.maximum-number-of-results` must be at least
+the window divided by the interval (e.g. `1440` for a 24h window with an interval of 1m). A warning is logged on start
+if that's not the case.
 
 ### Announcements
 System-wide announcements allow you to display important messages at the top of the status page. These can be used to inform users about planned maintenance, ongoing issues, or general information. You can use markdown to format your announcements.
@@ -2877,6 +2918,35 @@ endpoints:
       - start: "14:30"
         duration: 1h
         timezone: "Europe/Berlin"
+```
+
+#### Maintenance reported by the endpoint
+Maintenance windows are known in advance. When the monitored target announces maintenance on its own instead
+(e.g. a status page reporting a scheduled maintenance as in progress), use `maintenance-conditions`: a successful
+check for which all of them are met is marked as maintenance. It is shown in blue on the dashboard, with the
+endpoint's status badge reading "Maintenance" and `maintenance-message` in the tooltip, instead of looking like
+an ordinary success.
+
+`maintenance-conditions` use the same syntax as `conditions`, but they never affect whether a check succeeds,
+and they are not listed among the check's condition results. A failed check is never marked as maintenance, so
+the regular `conditions` must accept the maintenance state for it to be shown (e.g. with `any()`). Since such a
+check is successful, it does not trigger alerts.
+
+`maintenance-message` is either a literal message or a single placeholder resolved against the check's result.
+
+On the dashboard history, a period is shown as maintenance when all of its checks succeeded and at least one of
+them was under maintenance; a failure within the same period takes precedence.
+
+```yaml
+endpoints:
+  - name: api
+    url: "https://example.org/status"
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY].status == any(healthy, maintenance)"
+    maintenance-conditions:
+      - "[BODY].status == maintenance"
+    maintenance-message: "[BODY].detail"
 ```
 
 

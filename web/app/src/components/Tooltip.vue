@@ -9,7 +9,84 @@
     ]"
     :style="`top: ${top}px; left: ${left}px;`"
   >
-    <div v-if="result" class="space-y-2">
+    <!-- History bin (aggregation of all results within a period of time) -->
+    <div v-if="result && isHistoryBin" class="space-y-2">
+      <div class="flex items-center gap-2">
+        <span :class="['inline-block w-2 h-2 rounded-full', historyBinDotClass]"></span>
+        <span class="text-xs font-semibold">{{ historyBinTitle }}</span>
+      </div>
+
+      <div v-if="result.state === 'maintenance' && result.maintenanceMessage">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Maintenance</div>
+        <div class="text-xs text-blue-600 dark:text-blue-400 max-w-xs">{{ result.maintenanceMessage }}</div>
+      </div>
+
+      <div>
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Period</div>
+        <div class="font-mono text-xs">{{ prettifyTimestamp(result.start) }}</div>
+        <div class="font-mono text-xs">{{ prettifyTimestamp(result.end) }}</div>
+      </div>
+
+      <div v-if="result.checks > 0">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Checks</div>
+        <div class="font-mono text-xs">
+          <span :class="result.successfulChecks === result.checks ? 'text-green-500' : (result.successfulChecks === 0 ? 'text-red-500' : 'text-orange-500')">
+            {{ result.successfulChecks }}/{{ result.checks }} successful
+          </span>
+          <span v-if="result.maintenanceChecks > 0" class="text-blue-500">
+            ({{ result.maintenanceChecks }} under maintenance)
+          </span>
+        </div>
+      </div>
+
+      <!-- Conditions and errors of the last failed check of the bin or, if no check failed, of its last check -->
+      <div v-if="result.conditionResults && result.conditionResults.length">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Conditions ({{ historyBinDetailsLabel }})</div>
+        <div class="font-mono text-xs space-y-0.5">
+          <div
+            v-for="(conditionResult, index) in result.conditionResults"
+            :key="index"
+            class="flex items-start gap-1"
+          >
+            <span :class="conditionResult.success ? 'text-green-500' : 'text-red-500'">
+              {{ conditionResult.success ? '✓' : '✗' }}
+            </span>
+            <span class="break-all">{{ conditionResult.condition }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="result.errors && result.errors.length">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Errors ({{ historyBinDetailsLabel }})</div>
+        <div class="font-mono text-xs space-y-0.5">
+          <div v-for="(error, index) in result.errors" :key="index" class="text-red-500 dark:text-red-400">
+            • {{ error }}
+          </div>
+        </div>
+      </div>
+
+      <div v-if="result.checks > 0">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Response Time</div>
+        <div class="font-mono text-xs">
+          ~{{ Math.trunc((result.averageDuration || 0) / 1000000) }}ms
+          <span v-if="result.checks > 1" class="text-muted-foreground">
+            ({{ Math.trunc((result.minimumDuration || 0) / 1000000) }}-{{ Math.trunc((result.maximumDuration || 0) / 1000000) }}ms)
+          </span>
+        </div>
+      </div>
+
+      <div v-if="result.lastFailedCheck">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Last Failed Check</div>
+        <div class="font-mono text-xs">{{ prettifyTimestamp(result.lastFailedCheck) }}</div>
+      </div>
+
+      <div v-if="result.lastCheck">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Last Check</div>
+        <div class="font-mono text-xs">{{ prettifyTimestamp(result.lastCheck) }}</div>
+      </div>
+    </div>
+
+    <div v-else-if="result" class="space-y-2">
       <!-- Status (for suite results) -->
       <div v-if="isSuiteResult" class="flex items-center gap-2">
         <span :class="[
@@ -19,6 +96,12 @@
         <span class="text-xs font-semibold">
           {{ result.success ? 'Suite Passed' : 'Suite Failed' }}
         </span>
+      </div>
+
+      <!-- Maintenance (for endpoint results marked as such by the endpoint's maintenance-conditions) -->
+      <div v-if="!isSuiteResult && result.maintenance">
+        <div class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Maintenance</div>
+        <div class="text-xs text-blue-600 dark:text-blue-400 max-w-xs">{{ result.maintenanceMessage || 'Under maintenance' }}</div>
       </div>
 
       <!-- Timestamp -->
@@ -124,6 +207,41 @@ const tooltip = ref(null)
 const targetElement = ref(null)
 
 // Computed properties
+const isHistoryBin = computed(() => {
+  return props.result && props.result.state !== undefined && props.result.start !== undefined
+})
+
+const historyBinTitle = computed(() => {
+  if (!isHistoryBin.value) return ''
+  const bin = props.result
+  if (bin.checks === 0) {
+    if (bin.state === 'up') return 'Up (no check during this period)'
+    if (bin.state === 'down') return 'Down (no check during this period)'
+    if (bin.state === 'maintenance') return 'Under maintenance (no check during this period)'
+    return 'No data'
+  }
+  if (bin.state === 'up') return 'All checks passed'
+  if (bin.state === 'maintenance') return 'All checks passed, under maintenance'
+  if (bin.state === 'down') return 'All checks failed'
+  return 'Some checks failed'
+})
+
+// The conditions and errors of a bin are those of its last failed check if one failed, and of its last check otherwise
+const historyBinDetailsLabel = computed(() => {
+  return isHistoryBin.value && props.result.lastFailedCheck ? 'last failed check' : 'last check'
+})
+
+const historyBinDotClass = computed(() => {
+  if (!isHistoryBin.value) return ''
+  switch (props.result.state) {
+    case 'up': return 'bg-green-500'
+    case 'degraded': return 'bg-orange-500'
+    case 'down': return 'bg-red-500'
+    case 'maintenance': return 'bg-blue-500'
+    default: return 'bg-gray-400 dark:bg-gray-500'
+  }
+})
+
 const isSuiteResult = computed(() => {
   return props.result && props.result.endpointResults !== undefined
 })

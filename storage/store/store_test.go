@@ -651,3 +651,216 @@ func TestAutoSave(t *testing.T) {
 	cancelFunc()
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestStore_GetEndpointHistoryByKey(t *testing.T) {
+	scenarios := initStoresAndBaseScenarios(t, "TestStore_GetEndpointHistoryByKey")
+	defer cleanUp(scenarios)
+	// 10 bins of 1 minute each
+	from := now.Add(-10 * time.Minute)
+	to := now
+	newResult := func(base endpoint.Result, timestamp time.Time, duration time.Duration) *endpoint.Result {
+		base.Timestamp = timestamp
+		base.Duration = duration
+		return &base
+	}
+	// Results must be inserted in chronological order
+	results := []*endpoint.Result{
+		newResult(testUnsuccessfulResult, from.Add(-5*time.Minute), 100*time.Millisecond),             // before the window
+		newResult(testSuccessfulResult, from.Add(2*time.Minute+10*time.Second), 150*time.Millisecond), // bin 2
+		newResult(testUnsuccessfulResult, from.Add(2*time.Minute+40*time.Second), 750*time.Millisecond),
+		newResult(testUnsuccessfulResult, from.Add(5*time.Minute+500*time.Millisecond), 100*time.Millisecond), // bin 5
+		newResult(testSuccessfulResult, from.Add(5*time.Minute+time.Second), 100*time.Millisecond),
+		newResult(testSuccessfulResult, to.Add(time.Minute), 100*time.Millisecond), // after the window
+	}
+	type ExpectedBin struct {
+		State            endpoint.HistoryState
+		Checks           int
+		SuccessfulChecks int
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.Name, func(t *testing.T) {
+			if _, err := scenario.Store.GetEndpointHistoryByKey(testEndpoint.Key(), from, to, 10, 0); !errors.Is(err, common.ErrEndpointNotFound) {
+				t.Errorf("expected ErrEndpointNotFound, got %v", err)
+			}
+			for _, result := range results {
+				if err := scenario.Store.InsertEndpointResult(&testEndpoint, result); err != nil {
+					t.Fatal("failed to insert result:", err)
+				}
+			}
+			if _, err := scenario.Store.GetEndpointHistoryByKey(testEndpoint.Key(), to, from, 10, 0); !errors.Is(err, common.ErrInvalidTimeRange) {
+				t.Errorf("expected ErrInvalidTimeRange, got %v", err)
+			}
+			checkBins := func(t *testing.T, history *endpoint.History, expected []ExpectedBin) {
+				if len(history.Bins) != len(expected) {
+					t.Fatalf("expected %d bins, got %d", len(expected), len(history.Bins))
+				}
+				for i, bin := range history.Bins {
+					if bin.State != expected[i].State || bin.Checks != expected[i].Checks || bin.SuccessfulChecks != expected[i].SuccessfulChecks {
+						t.Errorf("bin %d: expected state=%s checks=%d successful=%d, got state=%s checks=%d successful=%d", i, expected[i].State, expected[i].Checks, expected[i].SuccessfulChecks, bin.State, bin.Checks, bin.SuccessfulChecks)
+					}
+				}
+			}
+			t.Run("unlimited-carry-over", func(t *testing.T) {
+				history, err := scenario.Store.GetEndpointHistoryByKey(testEndpoint.Key(), from, to, 10, 0)
+				if err != nil {
+					t.Fatal("unexpected error:", err)
+				}
+				if history.Window != 10*time.Minute {
+					t.Errorf("expected window of 10m, got %s", history.Window)
+				}
+				checkBins(t, history, []ExpectedBin{
+					{endpoint.HistoryStateDown, 0, 0}, // carried over from the result before the window
+					{endpoint.HistoryStateDown, 0, 0},
+					{endpoint.HistoryStateDegraded, 2, 1},
+					{endpoint.HistoryStateDown, 0, 0}, // carried over from the last result of bin 2, which failed
+					{endpoint.HistoryStateDown, 0, 0},
+					{endpoint.HistoryStateDegraded, 2, 1}, // failed check followed by a successful check
+					{endpoint.HistoryStateUp, 0, 0},
+					{endpoint.HistoryStateUp, 0, 0},
+					{endpoint.HistoryStateUp, 0, 0},
+					{endpoint.HistoryStateUp, 0, 0},
+				})
+				degradedBin := history.Bins[2]
+				if degradedBin.AverageDuration != 450*time.Millisecond {
+					t.Errorf("expected average duration of 450ms, got %s", degradedBin.AverageDuration)
+				}
+				if degradedBin.MinimumDuration != 150*time.Millisecond || degradedBin.MaximumDuration != 750*time.Millisecond {
+					t.Errorf("expected min=150ms and max=750ms, got min=%s and max=%s", degradedBin.MinimumDuration, degradedBin.MaximumDuration)
+				}
+				if !degradedBin.LastCheck.Equal(results[2].Timestamp) {
+					t.Errorf("expected last check of bin 2 to be %s, got %s", results[2].Timestamp, degradedBin.LastCheck)
+				}
+				if !history.Bins[0].LastCheck.Equal(results[0].Timestamp) {
+					t.Errorf("expected carried over bin 0 to reference the result before the window (%s), got %s", results[0].Timestamp, history.Bins[0].LastCheck)
+				}
+				// checkDetails checks that the bin references expectedLastCheck through LastCheck, expectedLastFailedCheck
+				// (nil if none) through LastFailedCheck, and that it has the errors and condition results of the last
+				// failed check if there is one, or of the last check otherwise
+				checkDetails := func(t *testing.T, binIndex int, expectedLastCheck, expectedLastFailedCheck *endpoint.Result) {
+					bin := history.Bins[binIndex]
+					if !bin.LastCheck.Equal(expectedLastCheck.Timestamp) {
+						t.Errorf("bin %d: expected last check to be %s, got %s", binIndex, expectedLastCheck.Timestamp, bin.LastCheck)
+					}
+					expected := expectedLastCheck
+					if expectedLastFailedCheck == nil {
+						if !bin.LastFailedCheck.IsZero() {
+							t.Errorf("bin %d: expected no last failed check, got %s", binIndex, bin.LastFailedCheck)
+						}
+					} else {
+						expected = expectedLastFailedCheck
+						if !bin.LastFailedCheck.Equal(expectedLastFailedCheck.Timestamp) {
+							t.Errorf("bin %d: expected last failed check to be %s, got %s", binIndex, expectedLastFailedCheck.Timestamp, bin.LastFailedCheck)
+						}
+					}
+					if len(bin.Errors) != len(expected.Errors) {
+						t.Fatalf("bin %d: expected %d errors, got %d", binIndex, len(expected.Errors), len(bin.Errors))
+					}
+					for i := range expected.Errors {
+						if bin.Errors[i] != expected.Errors[i] {
+							t.Errorf("bin %d: expected error %q, got %q", binIndex, expected.Errors[i], bin.Errors[i])
+						}
+					}
+					if len(bin.ConditionResults) != len(expected.ConditionResults) {
+						t.Fatalf("bin %d: expected %d condition results, got %d", binIndex, len(expected.ConditionResults), len(bin.ConditionResults))
+					}
+					for i, conditionResult := range expected.ConditionResults {
+						if *bin.ConditionResults[i] != *conditionResult {
+							t.Errorf("bin %d: expected condition result %v, got %v", binIndex, *conditionResult, *bin.ConditionResults[i])
+						}
+					}
+				}
+				// Bin 0 is carried over from the failed result that preceded the window
+				checkDetails(t, 0, results[0], results[0])
+				// Bin 2's last result failed
+				checkDetails(t, 2, results[2], results[2])
+				// Bin 3 has no result, so it is carried over from bin 2's last result, which failed
+				checkDetails(t, 3, results[2], results[2])
+				// Bin 5 has a failed result followed by a successful one, so the details must be those of the failed one
+				checkDetails(t, 5, results[4], results[3])
+				// Bin 6 has no result, so it is carried over from bin 5's last result, which succeeded
+				checkDetails(t, 6, results[4], nil)
+			})
+			t.Run("limited-carry-over", func(t *testing.T) {
+				history, err := scenario.Store.GetEndpointHistoryByKey(testEndpoint.Key(), from, to, 10, 2*time.Minute)
+				if err != nil {
+					t.Fatal("unexpected error:", err)
+				}
+				checkBins(t, history, []ExpectedBin{
+					{endpoint.HistoryStateUnknown, 0, 0}, // the result before the window is 5m old
+					{endpoint.HistoryStateUnknown, 0, 0},
+					{endpoint.HistoryStateDegraded, 2, 1},
+					{endpoint.HistoryStateDown, 0, 0},
+					{endpoint.HistoryStateDown, 0, 0},
+					{endpoint.HistoryStateDegraded, 2, 1}, // failed check followed by a successful check
+					{endpoint.HistoryStateUp, 0, 0},
+					{endpoint.HistoryStateUp, 0, 0},
+					{endpoint.HistoryStateUnknown, 0, 0}, // the last result is more than 2m old
+					{endpoint.HistoryStateUnknown, 0, 0},
+				})
+			})
+		})
+	}
+}
+
+func TestStore_GetEndpointHistoryByKeyWithMaintenance(t *testing.T) {
+	scenarios := initStoresAndBaseScenarios(t, "TestStore_GetEndpointHistoryByKeyWithMaintenance")
+	defer cleanUp(scenarios)
+	// 5 bins of 1 minute each
+	from := now.Add(-5 * time.Minute)
+	to := now
+	newResult := func(base endpoint.Result, timestamp time.Time, maintenanceMessage string) *endpoint.Result {
+		base.Timestamp = timestamp
+		if len(maintenanceMessage) > 0 {
+			base.Maintenance = true
+			base.MaintenanceMessage = maintenanceMessage
+		}
+		return &base
+	}
+	// Results must be inserted in chronological order
+	results := []*endpoint.Result{
+		newResult(testSuccessfulResult, from.Add(-time.Minute), "before the window"),     // carried over into bin 0
+		newResult(testSuccessfulResult, from.Add(time.Minute+10*time.Second), "first"),   // bin 1
+		newResult(testSuccessfulResult, from.Add(time.Minute+20*time.Second), "second"),  // bin 1
+		newResult(testSuccessfulResult, from.Add(time.Minute+30*time.Second), ""),        // bin 1
+		newResult(testSuccessfulResult, from.Add(2*time.Minute+10*time.Second), "third"), // bin 2
+		newResult(testUnsuccessfulResult, from.Add(2*time.Minute+20*time.Second), ""),    // bin 2
+		newResult(testSuccessfulResult, from.Add(3*time.Minute+10*time.Second), ""),      // bin 3
+	}
+	expected := []struct {
+		state             endpoint.HistoryState
+		maintenanceChecks int
+		message           string
+	}{
+		{endpoint.HistoryStateMaintenance, 0, "before the window"},
+		{endpoint.HistoryStateMaintenance, 2, "second"},
+		{endpoint.HistoryStateDegraded, 1, ""},
+		{endpoint.HistoryStateUp, 0, ""},
+		{endpoint.HistoryStateUp, 0, ""},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.Name, func(t *testing.T) {
+			for _, result := range results {
+				if err := scenario.Store.InsertEndpointResult(&testEndpoint, result); err != nil {
+					t.Fatal("failed to insert result:", err)
+				}
+			}
+			history, err := scenario.Store.GetEndpointHistoryByKey(testEndpoint.Key(), from, to, 5, 0)
+			if err != nil {
+				t.Fatal("unexpected error:", err)
+			}
+			for i, bin := range history.Bins {
+				if bin.State != expected[i].state || bin.MaintenanceChecks != expected[i].maintenanceChecks || bin.MaintenanceMessage != expected[i].message {
+					t.Errorf("bin %d: expected state=%s maintenanceChecks=%d message=%q, got state=%s maintenanceChecks=%d message=%q", i, expected[i].state, expected[i].maintenanceChecks, expected[i].message, bin.State, bin.MaintenanceChecks, bin.MaintenanceMessage)
+				}
+			}
+			status, err := scenario.Store.GetEndpointStatusByKey(testEndpoint.Key(), paging.NewEndpointStatusParams().WithResults(1, 10))
+			if err != nil {
+				t.Fatal("unexpected error:", err)
+			}
+			if len(status.Results) != len(results) || !status.Results[2].Maintenance || status.Results[2].MaintenanceMessage != "second" || status.Results[3].Maintenance {
+				t.Error("expected the maintenance and maintenance message of each result to be persisted")
+			}
+		})
+		scenario.Store.Clear()
+	}
+}

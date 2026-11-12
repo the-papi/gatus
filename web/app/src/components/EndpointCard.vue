@@ -33,7 +33,17 @@
             <div class="flex-1"></div>
             <p class="text-xs text-muted-foreground" :title="showAverageResponseTime ? 'Average response time' : 'Minimum and maximum response time'">{{ formattedResponseTime }}</p>
           </div>
-          <div class="flex gap-0.5">
+          <div v-if="historyBins" class="flex gap-0.5">
+            <div
+              v-for="(bin, index) in historyBins"
+              :key="index"
+              :class="['flex-1 h-6 sm:h-8 rounded-sm transition-all cursor-pointer', getHistoryBinClass(bin, index)]"
+              @mouseenter="handleMouseEnter(bin, $event)"
+              @mouseleave="handleMouseLeave(bin, $event)"
+              @click.stop="handleClick(bin, $event, index)"
+            />
+          </div>
+          <div v-else class="flex gap-0.5">
             <div
               v-for="(result, index) in displayResults"
               :key="index"
@@ -41,8 +51,10 @@
                 'flex-1 h-6 sm:h-8 rounded-sm transition-all',
                 result ? 'cursor-pointer' : '',
                 result ? (
-                  result.success 
-                    ? (selectedResultIndex === index ? 'bg-green-700' : 'bg-green-500 hover:bg-green-700')
+                  result.success
+                    ? (result.maintenance
+                      ? (selectedResultIndex === index ? 'bg-blue-700' : 'bg-blue-500 hover:bg-blue-700')
+                      : (selectedResultIndex === index ? 'bg-green-700' : 'bg-green-500 hover:bg-green-700'))
                     : (selectedResultIndex === index ? 'bg-red-700' : 'bg-red-500 hover:bg-red-700')
                 ) : 'bg-gray-200 dark:bg-gray-700'
               ]"
@@ -55,6 +67,10 @@
             <span>{{ oldestResultTime }}</span>
             <span>{{ newestResultTime }}</span>
           </div>
+          <!-- While the latest check is under maintenance, its message is shown without having to hover -->
+          <p v-if="currentMaintenanceMessage" class="mt-2 text-xs text-blue-600 dark:text-blue-400 break-words">
+            {{ currentMaintenanceMessage }}
+          </p>
         </div>
       </div>
     </CardContent>
@@ -99,12 +115,38 @@ const latestResult = computed(() => {
 
 const currentStatus = computed(() => {
   if (!latestResult.value) return 'unknown'
-  return latestResult.value.success ? 'healthy' : 'unhealthy'
+  if (!latestResult.value.success) return 'unhealthy'
+  return latestResult.value.maintenance ? 'maintenance' : 'healthy'
+})
+
+const currentMaintenanceMessage = computed(() => {
+  if (currentStatus.value !== 'maintenance') return null
+  return latestResult.value.maintenanceMessage || 'Under maintenance'
 })
 
 const hostname = computed(() => {
   return latestResult.value?.hostname || null
 })
+
+// When a dashboard-history window is configured for the endpoint, the server returns the results of that window
+// aggregated into bins of equal width, which are displayed instead of the last results
+const historyBins = computed(() => {
+  const bins = props.endpoint.history?.bins
+  return bins && bins.length > 0 ? bins : null
+})
+
+const historyBinClasses = {
+  up: { default: 'bg-green-500 hover:bg-green-700', selected: 'bg-green-700' },
+  degraded: { default: 'bg-orange-400 hover:bg-orange-600 dark:bg-orange-500 dark:hover:bg-orange-700', selected: 'bg-orange-600 dark:bg-orange-700' },
+  down: { default: 'bg-red-500 hover:bg-red-700', selected: 'bg-red-700' },
+  maintenance: { default: 'bg-blue-500 hover:bg-blue-700', selected: 'bg-blue-700' },
+  unknown: { default: 'bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600', selected: 'bg-gray-300 dark:bg-gray-600' }
+}
+
+const getHistoryBinClass = (bin, index) => {
+  const classes = historyBinClasses[bin.state] || historyBinClasses.unknown
+  return selectedResultIndex.value === index ? classes.selected : classes.default
+}
 
 const displayResults = computed(() => {
   const results = [...(props.endpoint.results || [])]
@@ -115,25 +157,32 @@ const displayResults = computed(() => {
 })
 
 const formattedResponseTime = computed(() => {
-  if (!props.endpoint.results || props.endpoint.results.length === 0) {
-    return 'N/A'
-  }
-  
   let total = 0
   let count = 0
   let min = Infinity
   let max = 0
-  
-  for (const result of props.endpoint.results) {
-    if (result.duration) {
-      const durationMs = result.duration / 1000000
-      total += durationMs
-      count++
-      min = Math.min(min, durationMs)
-      max = Math.max(max, durationMs)
+
+  if (historyBins.value) {
+    for (const bin of historyBins.value) {
+      if (bin.checks > 0 && bin.averageDuration) {
+        total += (bin.averageDuration / 1000000) * bin.checks
+        count += bin.checks
+        min = Math.min(min, (bin.minimumDuration || 0) / 1000000)
+        max = Math.max(max, (bin.maximumDuration || 0) / 1000000)
+      }
+    }
+  } else {
+    for (const result of props.endpoint.results || []) {
+      if (result.duration) {
+        const durationMs = result.duration / 1000000
+        total += durationMs
+        count++
+        min = Math.min(min, durationMs)
+        max = Math.max(max, durationMs)
+      }
     }
   }
-  
+
   if (count === 0) return 'N/A'
   
   if (props.showAverageResponseTime) {
@@ -152,6 +201,7 @@ const formattedResponseTime = computed(() => {
 })
 
 const oldestResultTime = computed(() => {
+  if (historyBins.value) return generatePrettyTimeAgo(historyBins.value[0].start)
   if (!props.endpoint.results || props.endpoint.results.length === 0) return ''
   const oldestResultIndex = Math.max(0, props.endpoint.results.length - props.maxResults)
   return generatePrettyTimeAgo(props.endpoint.results[oldestResultIndex].timestamp)
